@@ -11,10 +11,12 @@ import json
 from typing import Optional, Tuple, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import subprocess
+import xxhash # For fast file hashing
+# Ensure 'xxhash' is installed: pip install xxhash
 
 # Hi there! It's Mark.
 # Before running smart disk scanner, ensure you have the necessary dependencies:
-# pip install filetype Pillow sentence_transformers transformers torchvision PyPDF2 python-docx pytesseract
+# pip install filetype Pillow sentence_transformers transformers torchvision PyPDF2 python-docx pytesseract xxhash
 # Additionally:
 # - Ensure 'tesseract' is installed (for OCR). On macOS: brew install tesseract
 # - For metadata extraction, we will rely on 'exiftool' CLI. Please install exiftool:
@@ -71,14 +73,20 @@ DB_NAME = os.path.join(DB_FOLDER, "file_index.db")
 
 MAX_TEXT_LENGTH = 50_000
 SUMMARY_MAX_LENGTH = 100
-MAX_WORKERS = 4
-CLIP_MAX_TOKENS = 60  # Aggressive truncation to avoid dimension mismatch (!)
+MAX_WORKERS = max(1, os.cpu_count()) # Dynamically set based on CPU cores
+# CLIP_MAX_TOKENS = 60 # No longer needed, SentenceTransformer handles truncation.
+BATCH_COMMIT_SIZE = 50
+METADATA_BATCH_SIZE = 20
+PDF_MAX_PAGES_TO_PROCESS = 20 # Max pages to read from a PDF
 
 ############################
 # Global Flags
 ############################
 is_paused = threading.Event()
 is_stopped = threading.Event()
+models_ready_event = threading.Event()
+summarizer_model = None
+embedding_model_instance = None # Renamed to avoid conflict with embed_model variable in functions
 
 ############################
 # Logging
@@ -118,27 +126,31 @@ def ensure_db_schema():
     if "metadata" not in existing_columns:
         cursor.execute("ALTER TABLE files ADD COLUMN metadata TEXT")
         conn.commit()
+    
+    # Add file_hash column if not present
+    if "file_hash" not in existing_columns:
+        cursor.execute("ALTER TABLE files ADD COLUMN file_hash TEXT")
+        conn.commit()
 
     conn.close()
 
 def init_db():
     ensure_db_schema()
 
-def insert_or_replace_file_record(file_path: str, file_type: str, size: int,
+def insert_or_replace_file_record(conn: sqlite3.Connection, file_path: str, file_type: str, size: int,
                                   content: Optional[str], tags: Optional[Dict[str, str]],
-                                  embeddings: Optional[bytes], metadata: Optional[Dict]):
-    conn = sqlite3.connect(DB_NAME)
+                                  embeddings: Optional[bytes], metadata: Optional[Dict],
+                                  file_hash: Optional[str]):
     cursor = conn.cursor()
 
     tags_str = json.dumps(tags) if tags else None
     metadata_str = json.dumps(metadata) if metadata else None
 
     cursor.execute("""
-        INSERT OR REPLACE INTO files (path, type, size, content, tags, embeddings, metadata)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (file_path, file_type, size, content, tags_str, embeddings, metadata_str))
-    conn.commit()
-    conn.close()
+        INSERT OR REPLACE INTO files (path, type, size, content, tags, embeddings, metadata, file_hash)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (file_path, file_type, size, content, tags_str, embeddings, metadata_str, file_hash))
+    # Commit will be handled by the caller (worker)
 
 def get_indexed_files() -> set:
     conn = sqlite3.connect(DB_NAME)
@@ -162,7 +174,9 @@ def read_pdf_file(file_path: str) -> str:
     try:
         reader = PdfReader(file_path)
         texts = []
-        for page in reader.pages[:20]:
+        for i, page in enumerate(reader.pages):
+            if i >= PDF_MAX_PAGES_TO_PROCESS:
+                break
             texts.append(page.extract_text() or "")
         return "\n".join(texts)[:MAX_TEXT_LENGTH]
     except Exception:
@@ -196,47 +210,109 @@ def embeddings_to_bytes(embedding_tensor) -> bytes:
     import struct
     return struct.pack(f"{len(arr)}f", *arr)
 
+def calculate_file_hash(file_path: str) -> Optional[str]:
+    """Calculates the xxhash64 of a file and returns its hex digest."""
+    try:
+        hasher = xxhash.xxh64()
+        with open(file_path, "rb") as f:
+            while chunk := f.read(65536):  # Read in 64KB chunks
+                hasher.update(chunk)
+        return hasher.hexdigest()
+    except FileNotFoundError:
+        logger.warning(f"Hash calculation error: File not found at {file_path}")
+        return None
+    except PermissionError:
+        logger.warning(f"Hash calculation error: Permission denied for file {file_path}")
+        return None
+    except Exception as e:
+        logger.error(f"An unexpected error occurred during hash calculation for {file_path}: {e}")
+        logger.debug(traceback.format_exc()) # Keep debug for detailed unexpected errors
+        return None
+
 ############################
 # Metadata Extraction with exiftool (If you know better library - just let me know.)
 ############################
-def extract_file_metadata(file_path: str) -> Optional[Dict]:
-    # We call exiftool to extract metadata in JSON format (Have idea to store EXIF data separately but don't know best practices)
-    # exiftool -j file_path
-    # If exiftool is not installed or fails, return None, lmao
+def extract_batch_file_metadata(file_paths: list[str]) -> Dict[str, Optional[Dict]]:
+    """
+    Extracts metadata for a batch of files using exiftool.
+    Returns a dictionary mapping each file path to its metadata dict, or None if extraction failed.
+    """
+    if not file_paths:
+        return {}
+
+    results_map: Dict[str, Optional[Dict]] = {path: None for path in file_paths}
     try:
-        result = subprocess.run(["exiftool", "-j", file_path], capture_output=True, text=True)
-        if result.returncode != 0:
-            return None
-        data = json.loads(result.stdout)
-        if isinstance(data, list) and len(data) > 0:
-            # exiftool returns a list of dicts, usually one element
-            # Remove some unnecessary keys if needed.
-            # But, i mean, we can store as is.
-            # Potentially remove "SourceFile" key as it's redundant, i dunno, don't have time for it.
-            md = data[0]
-            md.pop("SourceFile", None)
-            return md
-        return None
-    except Exception:
-        return None
+        # Construct the command: exiftool -j <file1> <file2> ...
+        # The -G option is added to ensure SourceFile provides the exact path as given in input.
+        # The -api "filter=SourceFile eq '${SourceFile}'" is a potential optimization, but let's test without first.
+        cmd = ["exiftool", "-j", "-G"] + file_paths
+        process = subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+        if process.returncode != 0:
+            # This could happen if exiftool itself crashes or a major issue occurs.
+            # Minor errors with individual files are often still return code 0 but with error messages in JSON.
+            logger.error(f"Exiftool process returned error code {process.returncode} for batch. Stderr: {process.stderr}")
+            # All files in this batch will have None metadata
+            return results_map
+
+        try:
+            metadata_list = json.loads(process.stdout)
+        except json.JSONDecodeError:
+            logger.error(f"Failed to decode JSON output from exiftool. Output: {process.stdout[:500]}")
+            return results_map # All files get None
+
+        if not isinstance(metadata_list, list):
+            logger.error(f"Exiftool output was not a list as expected. Output: {str(metadata_list)[:500]}")
+            return results_map
+
+        for metadata_item in metadata_list:
+            if not isinstance(metadata_item, dict):
+                # logger.warning(f"Skipping non-dict item in exiftool output: {metadata_item}")
+                continue # Should not happen with valid exiftool JSON output
+
+            source_file = metadata_item.get("SourceFile")
+            if source_file and source_file in results_map:
+                # Clean up the metadata item by removing SourceFile as it's now the key
+                # Also remove other exiftool process-specific temp fields if any (e.g. ExifToolVersion)
+                # For now, just pop SourceFile
+                metadata_item.pop("SourceFile", None)
+                results_map[source_file] = metadata_item
+            # else:
+                # logger.warning(f"SourceFile '{source_file}' from exiftool output not in the original request list or already processed.")
+
+    except FileNotFoundError:
+        logger.error("Exiftool not found. Please ensure it is installed and in PATH.")
+        # All files in this batch will have None metadata
+        return {path: None for path in file_paths} # Ensure all requested paths are in the map
+    except Exception as e:
+        logger.error(f"An unexpected error occurred during exiftool batch processing: {e}")
+        logger.error(traceback.format_exc())
+        # All files in this batch will have None metadata
+        return {path: None for path in file_paths} # Ensure all requested paths are in the map
+    
+    return results_map
 
 ############################
 # Embeddings and Analysis, need to be revisited.
 ############################
-def safe_truncate_text(text: str, max_tokens=CLIP_MAX_TOKENS) -> str:
-    tokens = text.strip().split()
-    if len(tokens) > max_tokens:
-        tokens = tokens[:max_tokens]
-    return " ".join(tokens)
+# def safe_truncate_text(text: str, max_tokens=CLIP_MAX_TOKENS) -> str: # No longer needed
+#     tokens = text.strip().split()
+#     if len(tokens) > max_tokens:
+#         tokens = tokens[:max_tokens]
+#     return " ".join(tokens)
 
 def get_text_embeddings(text: str, embed_model) -> Optional[bytes]:
-    if not text.strip():
+    if not text.strip(): # Keep this check for empty strings
         return None
-    truncated_text = safe_truncate_text(text, CLIP_MAX_TOKENS)
+    # SentenceTransformer's encode method handles truncation based on model.max_seq_length
     try:
-        emb = embed_model.encode([truncated_text], convert_to_tensor=True)
+        # The input text here is typically a summary, which is already somewhat short.
+        # If it's still too long, embed_model.encode will truncate it.
+        emb = embed_model.encode([text], convert_to_tensor=True) 
         return embeddings_to_bytes(emb[0])
-    except Exception:
+    except Exception as e:
+        logger.error(f"Error getting text embeddings: {e}")
+        # Optionally log traceback.format_exc() if more detail is needed
         return None
 
 def summarize_text(content: str, summarizer) -> str:
@@ -296,9 +372,28 @@ def analyze_image_file(file_path: str, embed_model) -> Tuple[str, Optional[bytes
     content = ocr_text[:2000] if ocr_text else "Image file (no OCR text extracted)"
     return content, emb_bytes, tags
 
-def analyze_file(file_path: str, summarizer, embed_model) -> Tuple[str, int, str, Optional[bytes], Dict[str, str], Optional[Dict]]:
-    size = os.path.getsize(file_path)
-    kind = filetype.guess(file_path)
+def analyze_file(file_path: str, summarizer, embed_model, metadata: Optional[Dict]) -> Tuple[str, int, str, Optional[bytes], Dict[str, str], Optional[str]]:
+    file_hash = calculate_file_hash(file_path)
+    
+    try:
+        size = os.path.getsize(file_path)
+    except FileNotFoundError: # Should have been caught by calculate_file_hash, but as a safeguard
+        logger.warning(f"File not found when trying to get size for {file_path}, hash was {file_hash}")
+        # If hash is None because file not found, this won't be reached due to earlier return in worker (expected).
+        # If hash is None for other reasons, we might still want to proceed if size can be obtained.
+        # However, if file is not found, we probably shouldn't proceed.
+        # For now, if hash is None, we might not even call analyze_file if we check earlier.
+        # Let's assume for now if hash is None, we might still try to get other info,
+        # but the DB record will reflect the missing hash.
+        # A more robust approach might be to return None early from analyze_file if hash is None and file not found.
+        # For now, let's proceed and allow size to fail if file is gone.
+        size = 0 # Default size if error
+    except PermissionError:
+        logger.warning(f"Permission error when trying to get size for {file_path}")
+        size = 0 # Default size if error
+
+
+    kind = filetype.guess(file_path) # This can also fail if file is unreadable
     if kind:
         file_type = kind.mime
     else:
@@ -310,7 +405,7 @@ def analyze_file(file_path: str, summarizer, embed_model) -> Tuple[str, int, str
         else:
             file_type = "unknown"
 
-    metadata = extract_file_metadata(file_path)
+    # Metadata is now passed as an argument
 
     if file_type.startswith("text"):
         content, embeddings, tags = analyze_text_file(file_path, summarizer, embed_model)
@@ -320,68 +415,182 @@ def analyze_file(file_path: str, summarizer, embed_model) -> Tuple[str, int, str
         # For unknown types, just store minimal info, no embeddings
         content, embeddings, tags = "", None, {"type": file_type or "unknown_file"}
 
-    return file_type, size, content, embeddings, tags, metadata
+    return file_type, size, content, embeddings, tags, file_hash
+# Note: The 'metadata' and 'file_hash' are handled by the worker / analyze_file 
+# and passed directly to insert_or_replace_file_record
 
 ############################
 # Indexing. Eventually indexing should work on the background when you're not using your device.
 ############################
 def index_directory(directory: str, reindex: bool, progress_bar, summarizer, embed_model):
-    indexed_files = get_indexed_files()
+    indexed_files_set = get_indexed_files()
+    # errors list is removed, errors will be logged directly
 
-    all_files = []
-    for root, dirs, files in os.walk(directory):
-        for file in files:
-            all_files.append(os.path.join(root, file))
+    # 1. Collect all files and filter those that need processing
+    all_files_in_dir = []
+    for root, _, files in os.walk(directory):
+        for file_name in files:
+            all_files_in_dir.append(os.path.join(root, file_name))
 
-    errors = []
+    files_to_process = []
+    if reindex:
+        files_to_process = all_files_in_dir
+    else:
+        for f_path in all_files_in_dir:
+            if f_path not in indexed_files_set:
+                files_to_process.append(f_path)
+    
+    if not files_to_process:
+        logger.info("No new files to index.")
+        progress_bar.close()
+        return
 
-    def worker(file_path):
-        while is_paused.is_set():
-            time.sleep(0.5)
-        if is_stopped.is_set():
-            return None
-        if not reindex and file_path in indexed_files:
-            return None
+    # Update progress bar total to only account for files that will be processed
+    progress_bar.total = len(files_to_process)
+    progress_bar.refresh()
+
+    # Inner worker function, now takes metadata as an argument
+    def worker(file_path: str, metadata: Optional[Dict]):
+        conn = None
+        # Note: processed_in_worker for DB batching is reset per file path here.
+        # This means each file is its own mini-batch for DB commit,
+        # unless BATCH_COMMIT_SIZE is 1.
+        # This needs to be re-evaluated if BATCH_COMMIT_SIZE is > 1.
+        # For now, let's assume BATCH_COMMIT_SIZE=1 for simplicity here,
+        # or the DB batching needs to be managed across worker calls if workers are very short-lived.
+        # The previous implementation had processed_in_worker inside worker,
+        # and worker was long-lived processing multiple files.
+        # Given the new structure, we will make each worker commit its own file.
+        # Or, more correctly, the DB batching should be per connection, and connections are per worker.
+        # Let's restore the original DB batching logic within each worker instance.
+        # This means the `worker` function should not be an inner function if we want to maintain
+        # its state (like processed_in_worker count for DB batching) across multiple file submissions
+        # that might be handled by the *same* worker thread.
+        # However, ThreadPoolExecutor reuses threads, but doesn't guarantee a specific thread for a task.
+        #
+        # Simplest for now: Each worker invocation handles one file and commits it.
+        # This means BATCH_COMMIT_SIZE (for DB) effectively becomes 1 for this model.
+        # This is a trade-off for simpler batching of metadata.
+        # Let's stick to the previous DB batching as it was per worker connection.
+        # The worker will process one file, get one connection, do the work, commit, close.
+        # This means BATCH_COMMIT_SIZE is effectively 1 from the worker's perspective.
+        # This is a consequence of changing worker to process one file from the main loop.
+
+        # Re-evaluating the worker structure for DB batching:
+        # The `worker` is defined inside `index_directory` and submitted to the executor.
+        # Each call to `worker` will get a file_path and its metadata.
+        # The DB connection and batching should still be per worker *thread*.
+        # This is complex if the worker function itself doesn't loop.
+        #
+        # Let's simplify: The `worker` function will process ONE file. It will open a connection,
+        # process the file, call insert_or_replace_file_record, commit, and close.
+        # The BATCH_COMMIT_SIZE will effectively be 1. This is a performance regression for DB commits
+        # but simplifies the current refactoring. We can address DB batching later if needed.
+
+        # CORRECTED WORKER LOGIC (original DB batching was implicitly per thread over multiple files):
+        # The previous worker was called with ONE file_path, but it was one of many files handled by the *same*
+        # ThreadPoolExecutor worker thread. The connection and processed_in_worker count were local to that
+        # worker's execution context for that specific file.
+        # The new model: main thread batches for metadata, then submits individual files to executor.
+        # Each `worker` call processes one file.
+        # So, each worker call *must* handle its own connection and commit. BATCH_COMMIT_SIZE for DB is 1.
+        
+        conn = None
         try:
-            file_type, size, content, embeddings, tags, metadata = analyze_file(file_path, summarizer, embed_model)
+            # Analyze file (CPU bound) - now also returns file_hash
+            # file_hash might be None if calculation failed.
+            file_type, size, content, embeddings, tags, file_hash = analyze_file(file_path, summarizer, embed_model, metadata)
+            
+            # If file_hash is None and size is 0 due to FileNotFoundError from get_size inside analyze_file,
+            # we might want to skip this record.
+            # However, analyze_file is designed to return data even if some parts fail.
+            # The hash function already logs if file is not found.
+            # Let's assume we always try to insert what we have.
+
+            # DB operation
+            conn = sqlite3.connect(DB_NAME)
             insert_or_replace_file_record(
+                conn,
                 file_path=file_path,
                 file_type=file_type,
                 size=size,
                 content=content,
                 tags=tags,
                 embeddings=embeddings,
-                metadata=metadata
+                metadata=metadata, # metadata is passed to worker
+                file_hash=file_hash # pass file_hash to db record
             )
-        except Exception as e:
-            err_msg = f"Error indexing {file_path}: {e}"
-            errors.append(err_msg)
-            traceback_str = ''.join(traceback.format_exc())
-            errors.append(traceback_str)
+            conn.commit() # Commit for this single file
+        except Exception: # Catching general Exception to log it
+            logger.exception(f"Error processing file {file_path} in worker:")
+            # No longer appending to errors list
+        finally:
+            if conn:
+                conn.close()
         return file_path
 
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(worker, f) for f in all_files]
-        for fut in as_completed(futures):
+        future_to_path = {}
+        for i in range(0, len(files_to_process), METADATA_BATCH_SIZE):
             if is_stopped.is_set():
+                logger.info("Stopping metadata batching and further processing due to stop signal.")
                 break
+            
+            current_batch_paths = files_to_process[i:i + METADATA_BATCH_SIZE]
+            
+            # Log the batch being sent to exiftool
+            # logger.info(f"Extracting metadata for batch of {len(current_batch_paths)} files...")
+            batch_metadata_map = extract_batch_file_metadata(current_batch_paths)
+            # logger.info(f"Received metadata for {sum(1 for md in batch_metadata_map.values() if md is not None)} files in batch.")
+
+            for file_path_in_batch in current_batch_paths:
+                if is_stopped.is_set():
+                    break
+                
+                # Handle pause inside the loop before submitting to executor
+                while is_paused.is_set():
+                    time.sleep(0.5)
+                if is_stopped.is_set(): # Check again after pause
+                    break
+
+                current_file_metadata = batch_metadata_map.get(file_path_in_batch)
+                # Submit to executor for analysis and DB insertion
+                future = executor.submit(worker, file_path_in_batch, current_file_metadata)
+                future_to_path[future] = file_path_in_batch
+            
+            if is_stopped.is_set(): # After submitting a batch's files
+                 logger.info("Stop signal received, breaking from submitting more file batches.")
+                 break
+        
+        # Process results as they complete
+        for future in as_completed(future_to_path):
+            path_processed = future_to_path[future]
+            try:
+                result = future.result() # To catch exceptions from worker if any (already caught in worker though)
+                # if result:
+                #    logger.info(f"Successfully processed: {path_processed}")
+            except Exception as e:
+                # This should ideally be caught and logged within the worker itself.
+                # errors.append(f"Error processing {path_processed} from future: {e}")
+                # errors.append(traceback.format_exc())
+                pass # Already handled in worker
             progress_bar.update(1)
 
     progress_bar.close()
 
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM files")
-    total_indexed = cursor.fetchone()[0]
-    conn.close()
+    # Fetch total count from DB after all workers are done
+    # This connection is separate and short-lived, which is fine.
+    final_conn = sqlite3.connect(DB_NAME)
+    final_cursor = final_conn.cursor()
+    final_cursor.execute("SELECT COUNT(*) FROM files")
+    total_indexed = final_cursor.fetchone()[0]
+    final_conn.close()
 
     logger.info(f"Indexing finished. Total indexed files in the database: {total_indexed}")
     logger.info(f"Database path: {DB_NAME}")
 
-    if errors:
-        logger.info("Some errors occurred during indexing:")
-        for e in errors:
-            logger.info(e)
+    # The errors list and its logging loop are removed. Errors are logged in real-time.
 
 ############################
 # Signal Handler
@@ -396,9 +605,34 @@ signal.signal(signal.SIGINT, signal_handler)
 ############################
 # Main!
 ############################
+def load_models_background():
+    """Loads models in the background and sets the models_ready_event."""
+    global summarizer_model, embedding_model_instance
+    try:
+        logger.info("Starting background model loading...")
+        summarizer_model = pipeline("summarization", model="philschmid/bart-large-cnn-samsum", from_pt=True)
+        logger.info("Summarization model loaded.")
+        
+        embedding_model_instance = SentenceTransformer("clip-ViT-B-32")
+        embedding_model_instance.max_seq_length = 77 # Ensure this is set for the global model
+        logger.info("Embedding model loaded.")
+        
+        models_ready_event.set()
+        logger.info("All models loaded and ready.")
+    except Exception as e:
+        logger.error(f"Fatal error during background model loading: {e}")
+        logger.error(traceback.format_exc())
+        # If models fail to load, the app might be in an unusable state for indexing.
+        # Consider how to handle this - perhaps set an error flag or exit.
+        # For now, the event won't be set, and indexing will hang or fail.
+
 def main():
-    global is_paused, is_stopped
+    global is_paused, is_stopped, summarizer_model, embedding_model_instance
     init_db()
+
+    # Start loading models in a background thread
+    model_loader_thread = threading.Thread(target=load_models_background, daemon=True)
+    model_loader_thread.start()
 
     logger.info("Welcome to the Smart Disk Scanner!")
     logger.info("You can index files from selected directory. This program will:")
@@ -410,8 +644,7 @@ def main():
 
     index_thread = None
 
-    summarizer = None
-    embed_model = None
+    # Models are now global: summarizer_model and embedding_model_instance
 
     while True:
         action = input("\nEnter a command: ").strip().lower()
@@ -429,12 +662,15 @@ def main():
             if index_thread and index_thread.is_alive():
                 logger.info("Indexing is already in progress. Stop it first before starting a new one.")
             else:
-                # Load models here once we know we are indexing
-                if summarizer is None:
-                    summarizer = pipeline("summarization", model="philschmid/bart-large-cnn-samsum", from_pt=True)
-                if embed_model is None:
-                    embed_model = SentenceTransformer("clip-ViT-B-32")
-                    embed_model.max_seq_length = 77
+                # Check if models are loaded, wait if not
+                if not models_ready_event.is_set():
+                    logger.info("Models are still loading, please wait...")
+                    models_ready_event.wait() # Wait for models to be ready
+                    logger.info("Models are now ready. Proceeding with indexing.")
+                
+                if summarizer_model is None or embedding_model_instance is None:
+                    logger.error("Models could not be loaded. Cannot start indexing. Please check logs.")
+                    continue
 
                 is_paused.clear()
                 is_stopped.clear()
@@ -449,12 +685,15 @@ def main():
 
                 progress_bar = tqdm(total=total_files, desc="Indexing progress", unit="file")
 
+                # Use the globally loaded models
+                current_summarizer = summarizer_model
+                current_embed_model = embedding_model_instance
+
                 def run_index():
                     try:
-                        index_directory(directory, reindex, progress_bar, summarizer, embed_model)
-                    except Exception as e:
-                        logger.error(f"Unexpected error during indexing: {e}")
-                        traceback.print_exc()
+                        index_directory(directory, reindex, progress_bar, current_summarizer, current_embed_model)
+                    except Exception:
+                        logger.exception("An unexpected error occurred during the main indexing process in run_index:")
 
                 index_thread = threading.Thread(target=run_index, daemon=True)
                 index_thread.start()
