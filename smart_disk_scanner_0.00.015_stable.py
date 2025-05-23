@@ -1,3 +1,26 @@
+try:
+    import numpy
+    print(f"NumPy version: {numpy.__version__}")
+    import torch
+    print(f"PyTorch version: {torch.__version__}")
+    import transformers
+    print(f"Transformers version: {transformers.__version__}")
+    import sentence_transformers
+    print(f"Sentence-Transformers version: {sentence_transformers.__version__}")
+    import pandas
+    print(f"Pandas version: {pandas.__version__}")
+    import PIL
+    print(f"Pillow version: {PIL.__version__}")
+    import pytesseract
+    print(f"Pytesseract version: {pytesseract.get_tesseract_version()}") # Pytesseract version is often checked this way
+except ImportError as e:
+    print(f"Error importing one of the key libraries during debug check: {e}")
+except AttributeError as e:
+    print(f"AttributeError during debug check (possibly with pytesseract version): {e}")
+
+print("--- Debug import check complete. Starting main script imports... ---")
+
+# Main script imports follow
 import os
 import sys
 import sqlite3
